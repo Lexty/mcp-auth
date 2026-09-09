@@ -44,7 +44,7 @@ HTTPS URL with a globally routable address. It listens on loopback and expects a
 
 ```sh
 go run ./spike/m0 -public-url https://YOUR-STABLE-HOST -obs m0-observations.jsonl
-# in another shell, point a tunnel at 127.0.0.1:8080
+# in another shell, point a tunnel at 127.0.0.1:8420
 ```
 
 **Use a stable hostname.** A connector's authentication settings cannot be changed after it is
@@ -54,8 +54,8 @@ every time. Reserve a fixed domain before the first run.
 Flags worth knowing:
 
 - `-access-ttl` (default 5m) — short on purpose, so expiry behaviour is observed early.
-- `-listen` (default `127.0.0.1:8080`) — the tunnel's target.
-- `-admin` (default `127.0.0.1:8081`) — control endpoints. Loopback only; never expose it.
+- `-listen` (default `127.0.0.1:8420`) — the tunnel's target.
+- `-admin` (default `127.0.0.1:8421`) — control endpoints. Loopback only; never expose it.
 - `-mcp-path` (default `/mcp`) — the MCP endpoint. The registered connector URL must be
   `<public-url><mcp-path>` exactly, with no trailing slash.
 

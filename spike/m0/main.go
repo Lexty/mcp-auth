@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -34,11 +35,20 @@ type Config struct {
 	Identity   string
 }
 
+func isLoopbackURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" {
+		return false
+	}
+	h := u.Hostname()
+	return h == "localhost" || h == "127.0.0.1" || h == "::1"
+}
+
 func main() {
 	var cfg Config
 	flag.StringVar(&cfg.PublicURL, "public-url", "", "public HTTPS base URL the client will reach, e.g. https://name.example.com (required)")
-	flag.StringVar(&cfg.Listen, "listen", "127.0.0.1:8080", "local address for the public-facing handler, to be fronted by a tunnel")
-	flag.StringVar(&cfg.Admin, "admin", "127.0.0.1:8081", "loopback address for control endpoints; never expose this")
+	flag.StringVar(&cfg.Listen, "listen", "127.0.0.1:8420", "local address for the public-facing handler, to be fronted by a tunnel")
+	flag.StringVar(&cfg.Admin, "admin", "127.0.0.1:8421", "loopback address for control endpoints; never expose this")
 	flag.StringVar(&cfg.MCPPath, "mcp-path", "/mcp", "path of the MCP endpoint")
 	flag.StringVar(&cfg.ObsPath, "obs", "m0-observations.jsonl", "observation log")
 	flag.DurationVar(&cfg.AccessTTL, "access-ttl", 5*time.Minute, "access token lifetime; keep it short so expiry is observed rather than waited for")
@@ -50,8 +60,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "-public-url is required: the client reaches this server from the internet,\nand the URL is baked into the OAuth metadata it discovers.")
 		os.Exit(2)
 	}
-	if !strings.HasPrefix(cfg.PublicURL, "https://") {
-		fmt.Fprintln(os.Stderr, "-public-url must be https")
+	// HTTPS is required, with the loopback exception OAuth 2.1 already makes.
+	// That exception is what lets a native client on this machine drive the
+	// spike with no tunnel at all, which is the cheapest first observation
+	// available and needs no accounts.
+	if !strings.HasPrefix(cfg.PublicURL, "https://") && !isLoopbackURL(cfg.PublicURL) {
+		fmt.Fprintln(os.Stderr, "-public-url must be https, or http on a loopback host for a local client")
 		os.Exit(2)
 	}
 
