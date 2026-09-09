@@ -203,3 +203,31 @@ func TestPublicIPExcludesCarrierGradeNAT(t *testing.T) {
 		}
 	}
 }
+
+// Redaction runs in layers, and the layers must not eat each other. This one
+// cost a false observation: an Authorization header redacted by redactHeaders
+// was fingerprinted a second time by scrub, and the resulting line looked like
+// the client had presented a 29-character credential.
+func TestRedactionIsIdempotent(t *testing.T) {
+	h := http.Header{}
+	h.Set("Authorization", "Bearer "+secret)
+
+	once := redactHeaders(h)
+	twice := scrub("headers", once).(map[string]any)
+
+	got, _ := json.Marshal(twice)
+	if strings.Contains(string(got), secret) {
+		t.Fatalf("secret survived: %s", got)
+	}
+	if once["Authorization"] != twice["Authorization"] {
+		t.Errorf("second pass changed the value: %q became %q", once["Authorization"], twice["Authorization"])
+	}
+	if !strings.HasPrefix(twice["Authorization"].(string), "Bearer sha256:") {
+		t.Errorf("the scheme and the fingerprint must both survive, got %q", twice["Authorization"])
+	}
+	// And the fingerprint must still identify the token, or rotation cannot be
+	// followed across requests.
+	if !strings.Contains(twice["Authorization"].(string), Fingerprint(secret)) {
+		t.Errorf("fingerprint no longer identifies the credential: %q", twice["Authorization"])
+	}
+}

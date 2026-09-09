@@ -4,7 +4,12 @@ What a real MCP client actually did, recorded against the spike in `spike/m0`. T
 deliverable of the gate; the spike is not.
 
 **Run:** 2026-09-09, `spike/m0` at commit `4296eff` and later.
-**Client:** Claude Code 2.1.266–2.1.267, a **native** client running on the operator's own machine.
+**Clients:** two profiles, both observed.
+- **Native:** Claude Code 2.1.266–2.1.267, running on the operator's own machine, reaching the
+  spike on loopback.
+- **Hosted:** a custom connector on claude.ai, reaching the spike over the public internet through
+  a tunnel. Its MCP requests identify as `Claude-User`, with `clientInfo` naming
+  `Anthropic/Toolbox` and `Anthropic/ClaudeAI`.
 **Server:** the M0 spike — an authorization server of our own, no upstream identity provider,
 identity hard coded, no policy.
 
@@ -13,20 +18,48 @@ the rig cannot produce it at all, it says that instead — those are different f
 
 ## Status of the gate
 
-**M0 is not passed.** Experiment B (client → our own authorization server → tool call) is
-complete. Experiment A (client → identity provider directly → resource server) has not been
-attempted, because it needs a tenant that does not exist yet. A hosted connector has also not been
-observed; only the native profile has. See `m0-gate.md` for what those omissions do and do not
-license.
+**M0 is not passed, and one thing is left.** Experiment B is complete on **both** client profiles:
+a native client and a hosted custom connector each completed OAuth against our own authorization
+server and called a tool through it. Experiment A — client → identity provider directly → resource
+server — has not been attempted, because it needs a tenant that does not exist yet. That is the
+only remaining item.
+
+## The headline: the brief's last surviving premise is false
+
+The brief states, as established fact not to be re-checked, that on the hosted surface the callback
+succeeds and the backend then **never** posts to `/token`.
+
+It posted. The browser completed `/authorize` and the consent step, and Anthropic's backend then
+sent `POST /token` carrying the code, the PKCE verifier and `resource`, received a token, and went
+on to call `server/discover` and `tools/list` successfully. The tool call followed.
+
+That was the third of three. Two were refuted against documentation during validation; this one is
+refuted against a live client. **All three premises in a section headed "already established, no
+need to re-check" were wrong.** What the brief could not have known is a separate matter — the
+point is the instruction not to re-check, which is the part that would have cost the project.
 
 ## What was observed
 
-### Client registration — CIMD, not DCR
+### Client registration — CIMD, not DCR, on both profiles
 
-The client registered by **Client ID Metadata Document**, presenting
-`https://claude.ai/oauth/claude-code-client-metadata` as its `client_id`. The fetched document
-named the client "Claude Code", declared `token_endpoint_auth_method: none`, and listed exactly two
-redirect URIs, both port-less: `http://localhost/callback` and `http://127.0.0.1/callback`.
+Both clients registered by **Client ID Metadata Document**, and they use **different documents**:
+
+| Profile | `client_id` | `client_name` | `redirect_uris` |
+| --- | --- | --- | --- |
+| Native | `https://claude.ai/oauth/claude-code-client-metadata` | `Claude Code` | `http://localhost/callback`, `http://127.0.0.1/callback` — port-less |
+| Hosted | `https://claude.ai/oauth/mcp-oauth-client-metadata` | `Claude` | `https://claude.ai/api/mcp/auth_callback` |
+
+Both declare `token_endpoint_auth_method: none` and authenticated as public clients. The hosted
+document additionally lists `urn:ietf:params:oauth:grant-type:jwt-bearer` among its grant types —
+the enterprise assertion path, declared rather than hypothetical.
+
+This has a direct consequence for the admission policy the design requires: it is **a list, not a
+URL**, it grows with each client surface, and the two entries need *different* redirect-URI rules —
+exact match for the hosted one, port-agnostic loopback matching for the native one. Both must
+coexist.
+
+The hosted connector's setup dialog pre-selected CIMD on its own, having read
+`client_id_metadata_document_supported` and `none` from our metadata.
 
 This matters beyond configuration. The original brief argued that MCP clients "go looking for
 Dynamic Client Registration first", and used that as one of three reasons an identity provider
@@ -56,7 +89,7 @@ consistent with its metadata document, and sent the body as
 
 ### Transport
 
-- Protocol version **`2026-07-28`** — the revision that removed protocol-level sessions and the
+- Protocol version **`2026-07-28`** on both profiles, in all real traffic — the revision that removed protocol-level sessions and the
   GET stream.
 - The first method is **`server/discover`**, not `initialize`. There is no handshake.
 - `Mcp-Method` was present on every request and **agreed with the body method** every time.
@@ -64,8 +97,14 @@ consistent with its metadata document, and sent the body as
 - No `Mcp-Session-Id` was ever sent, consistent with that revision having no protocol sessions.
 - `Accept: application/json, text/event-stream` on every request.
 
-One discrepancy, recorded without an explanation: the MCP request declared `2026-07-28`, while the
-OAuth discovery requests that followed it carried `Mcp-Protocol-Version: 2025-11-25`.
+One discrepancy, recorded without an explanation: some probe requests — the hosted surface's
+capability detection before the connector is created, and OAuth discovery requests — carry
+`Mcp-Protocol-Version: 2025-11-25`, while every real MCP request on both profiles carries
+`2026-07-28`. Do not read the probe version as the version a client speaks; an earlier draft of
+this report did, and was wrong.
+
+- The hosted profile also sends **`traceparent`** (W3C trace context) inside `_meta`. A gateway
+  that does not forward it breaks tracing at itself.
 
 Discovery used the **path-suffixed** protected-resource metadata path
 (`/.well-known/oauth-protected-resource/mcp`) as well as the bare one.
@@ -113,9 +152,23 @@ refresh window, not by our preference.
 
 ## What was not observed, and why
 
-- **Experiment A**, the direct path to an identity provider. Blocked on a tenant.
-- **A hosted connector.** Only the native profile was exercised. The two differ in where the
-  connection originates, in the redirect URI, and in the exposure required.
+- **Experiment A**, the direct path to an identity provider. Blocked on a tenant. This is the only
+  remaining gate item.
+- **Token lifecycle on the hosted profile.** Expiry, rotation and a refused refresh were exercised
+  against the native client only. Nothing suggests the hosted backend differs, but nothing here
+  shows it either.
+
+## A defect in the instrument, recorded because it nearly became a finding
+
+Redaction runs in two layers — the header redactor, then a scrub on the way into the log — and the
+second layer was fingerprinting the first layer's output. The `Authorization` header therefore
+appeared as a 29-character opaque value, which is the length of `"Bearer sha256:xxxxxxxx len=43"`.
+Read carelessly, that looks like a claim about the credential the client presented.
+
+It was not a leak; it was the opposite, and worse for this purpose: it silently destroyed the
+correlation between a presented token and an issued one, which is one of the things the log exists
+to provide. Fingerprinting is now idempotent and there is a regression test. **No conclusion in
+this report rests on an `Authorization` header value.**
 
 ## What the rig cannot answer at all
 
@@ -138,10 +191,12 @@ Recording these as "the client did not do it" would be false:
    register" objection.
 2. **The loopback exception is exercised in practice**, not hypothetically. Whether the gateway
    serves native clients at all is a live decision, not a formality — `open-questions.md` Q7.
-3. **`resource` arrives and is usable.** The per-resource binding the design depends on can be
+3. **The hosted backend completes the token exchange.** Nothing in the design needs to work around
+   a broken hosted flow, because there is no broken hosted flow.
+4. **`resource` arrives and is usable.** The per-resource binding the design depends on can be
    recorded at issuance, because the client supplies it on both requests.
-4. **Refresh rotation is safe.** One-time rotation caused no failure across four rotations.
-5. **A filtered tool list carries cache obligations.** The gateway cannot rewrite `tools/list`
+5. **Refresh rotation is safe.** One-time rotation caused no failure across four rotations.
+6. **A filtered tool list carries cache obligations.** The gateway cannot rewrite `tools/list`
    without owning `cacheScope`.
-6. **The transport revision in the field is `2026-07-28`.** Any assumption based on
+7. **The transport revision in the field is `2026-07-28`.** Any assumption based on
    `Mcp-Session-Id` or a GET stream is about a different revision — `open-questions.md` Q3.

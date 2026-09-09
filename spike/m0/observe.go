@@ -66,6 +66,17 @@ var responseHeadersRecorded = []string{
 	"WWW-Authenticate", "Location", "Content-Type", "Cache-Control", "X-Frame-Options",
 }
 
+// alreadyRedacted reports whether a value has been through Fingerprint once.
+//
+// Redaction runs in layers on purpose — the header redactor, then scrub on the
+// way into the log — and without this check the second layer fingerprints the
+// first layer's output. That is not a leak, it is the opposite: it destroys
+// the correlation the fingerprint exists to provide, silently, and it produced
+// a log line that looked like a finding about the client.
+func alreadyRedacted(s string) bool {
+	return strings.Contains(s, "sha256:") && strings.Contains(s, " len=")
+}
+
 // Fingerprint turns a secret into something that can be compared across
 // requests without being reversible. This is what answers "did the client
 // present the rotated refresh token or the old one?" — the single question
@@ -73,6 +84,9 @@ var responseHeadersRecorded = []string{
 func Fingerprint(s string) string {
 	if s == "" {
 		return ""
+	}
+	if alreadyRedacted(s) {
+		return s
 	}
 	sum := sha256.Sum256([]byte(s))
 	return fmt.Sprintf("sha256:%x len=%d", sum[:4], len(s))
@@ -117,6 +131,9 @@ func scrub(key string, v any) any {
 			return Fingerprint(str)
 		}
 		return "[redacted]"
+	}
+	if str, ok := v.(string); ok && alreadyRedacted(str) {
+		return str
 	}
 	switch t := v.(type) {
 	case string:
