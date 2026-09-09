@@ -43,9 +43,12 @@ var secretParams = map[string]bool{
 	"apikey":                    true,
 	"api_key":                   true,
 	"secret":                    true,
-	"session":                   true,
-	"sid":                       true,
 }
+
+// Deliberately not secrets: "session" and "sid". The gateway's own session
+// identifier is a correlation key that the canonical audit schema requires
+// recording, not a credential presented for authentication. Fingerprinting it
+// would defeat the only thing it is for.
 
 // secretHeaders are headers whose value is never recorded.
 var secretHeaders = map[string]bool{

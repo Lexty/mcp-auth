@@ -425,6 +425,26 @@ whereas in Kubernetes `command` replaces `ENTRYPOINT` itself [R19].
 <https://docs.docker.com/reference/compose-file/services/#command>
 
 
+**[R23] Tool listing may vary by authorization — and it is cacheable, which is the trap.**
+The specification explicitly blesses filtering the tool list by the caller's entitlement:
+> "Servers that declare the `tools` capability **MUST** respond to `tools/list` requests with the
+> set of tools currently available to the requesting client. This set **MAY** be empty and **MAY**
+> change over time … but **MUST NOT** vary per-connection or as a side effect of other requests on
+> the connection. The set **MAY** vary by the authorization presented on the request — for example,
+> returning only the tools the caller's granted scopes permit — since credentials are per-request
+> input, not connection state."
+
+In the same breath, `tools/list` "supports pagination and caching", and a list result may carry
+`ttlMs` and `cacheScope`, with `"cacheScope": "public"` shown in the specification's own example.
+
+Both halves matter to a gateway that filters the list. The first is permission to do it at all.
+The second is a hazard: a per-entitlement list marked publicly cacheable would let one user's view
+of the tools be served to another.
+
+Results in this revision also carry `resultType`, on both `tools/list` and `tools/call`; a real
+client refused a list result that omitted it.
+<https://modelcontextprotocol.io/specification/draft/server/tools>
+
 ---
 
 # Carried, not verified

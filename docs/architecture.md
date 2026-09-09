@@ -110,8 +110,15 @@ full argument is in `security-model.md`.
 
 So the decision surface is: enforce from headers only where a verified backend makes them
 trustworthy; otherwise parse, or refuse. The interface exists to make that a choice rather than an
-accident. When per-tool policy arrives, `tools/list` must be filtered by entitlement, or the model
-will call what it may not and collect refusals.
+accident.
+
+When per-tool policy arrives, `tools/list` must be filtered by entitlement, or the model will call
+what it may not and collect refusals. The specification permits exactly that — the tool set "MAY
+vary by the authorization presented on the request … since credentials are per-request input, not
+connection state" [R23]. It also makes list results cacheable, with a `cacheScope` that can be
+`public`. A filtered list is not public, and a gateway that rewrites the list must therefore also
+take responsibility for the cache directives on it, or one user's view of the tools will be served
+to another.
 
 ## Tokens and state
 

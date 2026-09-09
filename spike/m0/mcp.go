@@ -115,11 +115,16 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 	case "notifications/initialized":
 		w.WriteHeader(http.StatusAccepted)
 	case "tools/list":
-		writeRPC(w, req.ID, map[string]any{"tools": []any{map[string]any{
-			"name":        "whoami",
-			"description": "Returns the identity the gateway spike believes is calling.",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
-		}}})
+		writeRPC(w, req.ID, map[string]any{
+			// resultType is required in this revision, and its absence is
+			// what the real client rejected the first list on.
+			"resultType": "complete",
+			"tools": []any{map[string]any{
+				"name":        "whoami",
+				"description": "Returns the identity the gateway spike believes is calling.",
+				"inputSchema": map[string]any{"type": "object", "additionalProperties": false},
+			}},
+		})
 	case "tools/call":
 		var p struct {
 			Name string `json:"name"`
@@ -143,11 +148,15 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 			writeRPCErr(w, req.ID, -32602, "unknown tool: "+p.Name)
 			return
 		}
-		writeRPC(w, req.ID, map[string]any{"content": []any{map[string]any{
-			"type": "text",
-			"text": fmt.Sprintf("subject=%s session=%s generation=%d resource=%s",
-				s.cfg.Identity, sess.ID, sess.Generation, sess.Resource),
-		}}})
+		writeRPC(w, req.ID, map[string]any{
+			"resultType": "complete",
+			"isError":    false,
+			"content": []any{map[string]any{
+				"type": "text",
+				"text": fmt.Sprintf("subject=%s session=%s generation=%d resource=%s",
+					s.cfg.Identity, sess.ID, sess.Generation, sess.Resource),
+			}},
+		})
 	default:
 		writeRPCErr(w, req.ID, -32601, "method not found: "+req.Method)
 	}
