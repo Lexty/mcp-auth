@@ -40,6 +40,20 @@ Experiment B is required regardless of how A turns out. Choosing the broker arch
 strength of argument alone, without having seen a real client complete a flow against our own
 authorization server, is the failure mode this gate exists to prevent.
 
+## Departure from this order, recorded 2026-09-09
+
+Experiment B was built and run first, because Experiment A needs an Entra tenant that does not yet
+exist. This is a departure from the order above and is written down rather than quietly taken.
+
+It is defensible only because B is required regardless of how A turns out. It is **not** a
+substitute for the control experiment, and **M0 is not passed**. Two conditions remain open:
+
+- Experiment A has not been attempted at all.
+- The client observed so far is a **native** client running on the operator's own machine. A
+  successful tool call through a real custom connector on a hosted surface is a separate mandatory
+  result. The two profiles differ in where the connection originates, in the redirect URI, and in
+  the exposure they require [R16][R17]; observing one says little about the other.
+
 ## What must be recorded
 
 The deliverable is the observation log. Absent branches are recorded as absent — "not observed"
