@@ -1,0 +1,4 @@
+# M0 observation runs. The log is a deliverable, but it belongs in a report
+# rather than in the repository: it records a specific run on a specific day.
+/.m0/
+/m0-observations.jsonl

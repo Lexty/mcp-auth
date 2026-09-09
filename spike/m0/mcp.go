@@ -60,9 +60,36 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// Reject an unsupported version the way the specification requires, so that
+	// a client's retry behaviour is observable rather than guessed at.
+	if v := r.Header.Get("MCP-Protocol-Version"); v != "" && !supported(v) {
+		s.obs.Write("unsupported_protocol_version", map[string]any{"requested": v})
+		writeRPCErrStatus(w, req.ID, http.StatusBadRequest, -32022, "Unsupported protocol version",
+			map[string]any{"supported": supportedVersions, "requested": v})
+		return
+	}
+
 	switch req.Method {
+	case "server/discover":
+		// Mandatory in the modern era, and the first thing a modern client
+		// sends. The spike answers as dual-era so that whichever way the
+		// client goes is observable.
+		s.obs.Write("mcp_discover", map[string]any{
+			"session": sess.ID, "client_declared_version": r.Header.Get("MCP-Protocol-Version"),
+			"params": redactJSON(rawAny(req.Params)),
+		})
+		writeRPC(w, req.ID, map[string]any{
+			"resultType":        "complete",
+			"supportedVersions": supportedVersions,
+			"capabilities":      map[string]any{"tools": map[string]any{}},
+			"instructions":      "M0 spike. One tool, hard coded identity, no policy.",
+			"_meta": map[string]any{
+				"io.modelcontextprotocol/serverInfo": map[string]any{"name": "m0-spike", "version": "0"},
+			},
+		})
 	case "initialize":
 		s.obs.Write("mcp_initialize", map[string]any{"session": sess.ID, "params": redactJSON(rawAny(req.Params))})
+
 		// Answer without minting a session id: whether the client then insists
 		// on one is itself an observation.
 		writeRPC(w, req.ID, map[string]any{
@@ -70,6 +97,7 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 			"serverInfo":      map[string]any{"name": "m0-spike", "version": "0"},
 		})
+		s.obs.Write("mcp_era", map[string]any{"era": "legacy", "session": sess.ID})
 	case "notifications/initialized":
 		w.WriteHeader(http.StatusAccepted)
 	case "tools/list":
@@ -160,13 +188,33 @@ func writeRPC(w http.ResponseWriter, id json.RawMessage, result any) {
 	json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": rawOrNull(id), "result": result})
 }
 
+// supportedVersions is deliberately dual-era: the spike should be able to talk
+// to whatever turns up, because which era a client uses is an observation.
+var supportedVersions = []string{"2026-07-28", "2025-11-25", "2025-06-18"}
+
+func supported(v string) bool {
+	for _, s := range supportedVersions {
+		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
+// An unknown method is a 404 with -32601 in the modern revision, which is what
+// distinguishes it from a legacy server that does not host this endpoint.
 func writeRPCErr(w http.ResponseWriter, id json.RawMessage, code int, msg string) {
+	writeRPCErrStatus(w, id, http.StatusNotFound, code, msg, nil)
+}
+
+func writeRPCErrStatus(w http.ResponseWriter, id json.RawMessage, status, code int, msg string, data any) {
+	e := map[string]any{"code": code, "message": msg}
+	if data != nil {
+		e["data"] = data
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusNotFound)
-	json.NewEncoder(w).Encode(map[string]any{
-		"jsonrpc": "2.0", "id": rawOrNull(id),
-		"error": map[string]any{"code": code, "message": msg},
-	})
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": rawOrNull(id), "error": e})
 }
 
 func rawOrNull(id json.RawMessage) any {
