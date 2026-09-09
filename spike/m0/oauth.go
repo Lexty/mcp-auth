@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -32,6 +34,7 @@ type Client struct {
 	Secret       string
 	Name         string
 	RedirectURIs []string
+	AuthMethod   string // token endpoint auth method this client registered with
 	Via          string // "dcr" | "cimd" | "preregistered"
 	Registered   time.Time
 	Raw          map[string]any
@@ -162,10 +165,21 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name, _ := req["client_name"].(string)
+	// A public client that asked for "none" and is handed a secret will not
+	// use it, and the exchange then proves nothing about either method.
+	authMethod, _ := req["token_endpoint_auth_method"].(string)
+	if authMethod == "" {
+		authMethod = "client_secret_post"
+	}
+	secret := token(24)
+	if authMethod == "none" {
+		secret = ""
+	}
 
 	c := &Client{
 		ID:           "dcr_" + token(12),
-		Secret:       token(24),
+		Secret:       secret,
+		AuthMethod:   authMethod,
 		Name:         name,
 		RedirectURIs: redirects,
 		Via:          "dcr",
@@ -184,23 +198,36 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		"request":       redactJSON(req),
 	})
 
-	writeJSON(w, 201, map[string]any{
+	out := map[string]any{
 		"client_id":                  c.ID,
-		"client_secret":              c.Secret,
 		"client_id_issued_at":        c.Registered.Unix(),
-		"client_secret_expires_at":   0,
 		"redirect_uris":              redirects,
-		"token_endpoint_auth_method": "client_secret_post",
+		"token_endpoint_auth_method": c.AuthMethod,
 		"grant_types":                []string{"authorization_code", "refresh_token"},
 		"response_types":             []string{"code"},
-	})
+	}
+	if c.Secret != "" {
+		out["client_secret"] = c.Secret
+		out["client_secret_expires_at"] = 0
+	}
+	writeJSON(w, 201, out)
 }
 
 // ---------- client id metadata documents ----------
 
-// resolveCIMD fetches a URL-shaped client_id. The SSRF guards here are the
-// spike's only concession to production concerns, and they are here because
-// this endpoint takes a URL from an unauthenticated caller and fetches it.
+// resolveCIMD fetches a URL-shaped client_id.
+//
+// A public endpoint that takes a URL from an unauthenticated caller and
+// fetches it is a server-side request forgery primitive. A first attempt here
+// resolved the host, checked the addresses, and then handed the name to an
+// ordinary HTTP client that resolved it again — so the addresses that were
+// checked were not the addresses that were connected to.
+//
+// Doing that properly needs address checking at dial time and a considered
+// position on proxies. For a throwaway experiment the honest answer is not to
+// do it properly but to not do it at all: only URLs the operator has named on
+// the command line are fetched. Anything else is refused and recorded, which
+// is itself an observation about which clients would have needed it.
 func (s *Server) resolveCIMD(clientID string) (*Client, error) {
 	u, err := url.Parse(clientID)
 	if err != nil {
@@ -212,12 +239,30 @@ func (s *Server) resolveCIMD(clientID string) (*Client, error) {
 	if u.Path == "" || u.Path == "/" {
 		return nil, fmt.Errorf("client_id must have a path component")
 	}
+	if !s.cimdAllowed(clientID) {
+		return nil, fmt.Errorf("client metadata document %q is not in -cimd-allow; "+
+			"the spike will not fetch arbitrary URLs", clientID)
+	}
 	if err := guardHost(u.Hostname()); err != nil {
 		return nil, err
 	}
 
 	cl := &http.Client{
 		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			// Defence in depth behind the allow list: check the address that
+			// is actually dialled, not one resolved earlier and separately.
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, _, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				if ip := net.ParseIP(host); ip != nil && !publicIP(ip) {
+					return nil, fmt.Errorf("refusing to connect to non-public address %s", host)
+				}
+				return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, network, addr)
+			},
+		},
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return fmt.Errorf("redirects are not followed when resolving client metadata")
 		},
@@ -257,23 +302,47 @@ func (s *Server) resolveCIMD(clientID string) (*Client, error) {
 		ID:           clientID,
 		Name:         name,
 		RedirectURIs: redirects,
+		AuthMethod:   "none", // CIMD clients authenticate as public clients
 		Via:          "cimd",
 		Registered:   time.Now(),
 		Raw:          doc,
 	}, nil
 }
 
+// cgnat is carrier-grade NAT space. None of net.IP's own predicates exclude
+// it, so a check built from IsPrivate and friends lets it through.
+var cgnat = net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
+
+func publicIP(ip net.IP) bool {
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() || ip.IsInterfaceLocalMulticast() {
+		return false
+	}
+	return !cgnat.Contains(ip)
+}
+
 func guardHost(host string) error {
-	ips, err := net.LookupIP(host)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
 		return fmt.Errorf("cannot resolve %s: %w", host, err)
 	}
 	for _, ip := range ips {
-		if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+		if !publicIP(ip) {
 			return fmt.Errorf("%s resolves to a non-public address", host)
 		}
 	}
 	return nil
+}
+
+func (s *Server) cimdAllowed(clientID string) bool {
+	for _, a := range s.cfg.CIMDAllow {
+		if a == clientID {
+			return true
+		}
+	}
+	return false
 }
 
 // lookupClient resolves a client_id from either registration mechanism.
@@ -320,9 +389,15 @@ func redirectAllowed(registered []string, presented string) (bool, string) {
 	if pu.Hostname() != "localhost" && pu.Hostname() != "127.0.0.1" && pu.Hostname() != "::1" {
 		return false, ""
 	}
+	// Only the port may differ. Query, fragment and userinfo are part of the
+	// registered value and ignoring them would widen the exception well past
+	// what RFC 8252 asks for.
+	if pu.User != nil || pu.RawQuery != "" || pu.Fragment != "" {
+		return false, ""
+	}
 	for _, r := range registered {
 		ru, err := url.Parse(r)
-		if err != nil {
+		if err != nil || ru.User != nil || ru.RawQuery != "" || ru.Fragment != "" {
 			continue
 		}
 		if ru.Scheme == pu.Scheme && ru.Hostname() == pu.Hostname() && ru.Path == pu.Path {
@@ -509,6 +584,37 @@ func (s *Server) tokenEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// authenticateClient checks that the caller is the client the code was issued
+// to, using the method that client registered with.
+func (s *Server) authenticateClient(r *http.Request, wantID string) error {
+	id, secret := r.PostFormValue("client_id"), r.PostFormValue("client_secret")
+	if bid, bsecret, ok := r.BasicAuth(); ok {
+		id, secret = bid, bsecret
+	}
+	if id == "" {
+		return fmt.Errorf("client_id is required")
+	}
+	if id != wantID {
+		return fmt.Errorf("client_id does not match the authorization request")
+	}
+	s.store.mu.Lock()
+	c := s.store.clients[wantID]
+	s.store.mu.Unlock()
+	if c == nil {
+		return fmt.Errorf("unknown client")
+	}
+	if c.AuthMethod == "none" {
+		return nil
+	}
+	if secret == "" {
+		return fmt.Errorf("client authentication is required for this client")
+	}
+	if subtle.ConstantTimeCompare([]byte(secret), []byte(c.Secret)) != 1 {
+		return fmt.Errorf("client authentication failed")
+	}
+	return nil
+}
+
 func clientAuthMethod(r *http.Request) string {
 	if _, _, ok := r.BasicAuth(); ok {
 		return "client_secret_basic"
@@ -528,6 +634,18 @@ func (s *Server) grantAuthorizationCode(w http.ResponseWriter, r *http.Request) 
 
 	if ac == nil || time.Now().After(ac.Expires) {
 		writeErr(w, 400, "invalid_grant", "unknown or expired code")
+		return
+	}
+	// A minimal server that skips these accepts a request a real one would
+	// refuse, so a success here would say nothing about the real thing.
+	if err := s.authenticateClient(r, ac.ClientID); err != nil {
+		s.obs.Write("client_auth_failed", map[string]any{"client_id": ac.ClientID, "error": err.Error()})
+		writeErr(w, 401, "invalid_client", err.Error())
+		return
+	}
+	if res := r.PostFormValue("resource"); res != "" && ac.Resource != "" && res != ac.Resource {
+		s.obs.Write("resource_mismatch", map[string]any{"authorize": ac.Resource, "token": res})
+		writeErr(w, 400, "invalid_target", "resource does not match the authorization request")
 		return
 	}
 	if ac.RedirectURI != r.PostFormValue("redirect_uri") {
@@ -582,12 +700,15 @@ func (s *Server) grantRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One critical section. Splitting the check from the consumption let two
+	// concurrent refreshes both see a live token, and rotation is precisely
+	// what this spike is meant to measure.
 	s.store.mu.Lock()
 	id, ok := s.store.byRefresh[rt]
 	retiredFrom, wasRetired := s.store.retiredRefresh[rt]
-	s.store.mu.Unlock()
 
 	if wasRetired {
+		s.store.mu.Unlock()
 		// The observation that matters most about rotation: the client came
 		// back with a token we already replaced.
 		s.obs.Write("refresh_reuse_of_retired_token", map[string]any{
@@ -597,15 +718,22 @@ func (s *Server) grantRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
+		s.store.mu.Unlock()
 		writeErr(w, 400, "invalid_grant", "unknown refresh token")
 		return
 	}
 
-	s.store.mu.Lock()
 	sess := s.store.sessions[id]
 	if sess == nil || sess.Revoked || time.Now().After(sess.RefreshExp) {
 		s.store.mu.Unlock()
 		writeErr(w, 400, "invalid_grant", "session is over")
+		return
+	}
+	if sess.RefreshToken != rt {
+		// Lost a race with another refresh for the same session.
+		s.store.mu.Unlock()
+		s.obs.Write("refresh_lost_race", map[string]any{"session": id})
+		writeErr(w, 400, "invalid_grant", "refresh token is no longer current")
 		return
 	}
 	sinceExpiry := time.Since(sess.AccessExp)
@@ -618,7 +746,12 @@ func (s *Server) grantRefresh(w http.ResponseWriter, r *http.Request) {
 	sess.Generation++
 	s.store.byAccess[sess.AccessToken] = sess.ID
 	s.store.byRefresh[sess.RefreshToken] = sess.ID
+	// An immutable snapshot for the response and the log, taken while the lock
+	// is still held: reading sess afterwards races a concurrent refresh and
+	// would corrupt the generation and fingerprint comparison.
+	snap := *sess
 	s.store.mu.Unlock()
+	sess = &snap
 
 	// A negative value means the client refreshed before the token expired.
 	// That number answers "does it refresh proactively, and how early?".

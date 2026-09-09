@@ -27,6 +27,34 @@ The mandatory observations in `docs/m0-gate.md`, each produced deliberately rath
 `refresh_rotated.seconds_past_access_expiry` is the one number worth watching: negative means the
 client refreshed *before* expiry, and its magnitude is how early.
 
+## What this rig cannot answer
+
+Recording these as "the client did not do it" would be false. They are not supported by the rig,
+which is a different finding:
+
+- **Streaming.** The spike never opens an SSE response, so nothing here observes long-lived
+  streams, keep-alives, or what a client does when one is interrupted.
+- **Cancellation across a proxy.** There is no separate backend: the spike answers requests
+  itself. Whether closing a client stream propagates to a backend request, and whether the
+  backend then stops work, cannot be tested without a controlled streaming fixture behind a real
+  proxy hop.
+- **The backend header/body contract.** The spike validates headers against the body and refuses a
+  mismatch, as the specification requires of a server that processes the body. That says nothing
+  about whether some *other* backend does, and it is precisely that unknown which decides whether
+  header-based policy is ever safe. See `docs/security-model.md`.
+
+## A caution about forced expiry
+
+`POST /control/expire-access` moves the expiry on the server only. The client still believes the
+`expires_in` it was given, so the next request tests **how it reacts to an unexpected 401** — not
+how it behaves around an expiry it knows about. Both are worth observing, and they are different
+observations; do not report one as the other.
+
+To see the client's own expiry behaviour, let a token expire naturally and touch nothing. This is
+why `-access-ttl` defaults to ten minutes rather than five: a client may refresh proactively up to
+five minutes before expiry, so a shorter lifetime leaves no window in which the token is live and
+not yet being refreshed.
+
 ## Secrets in the log
 
 Tokens, codes, verifiers and client secrets are never written. They are replaced by a truncated
@@ -47,6 +75,12 @@ go run ./spike/m0 -public-url https://YOUR-STABLE-HOST -obs m0-observations.json
 # in another shell, point a tunnel at 127.0.0.1:8420
 ```
 
+A native client on this machine needs no tunnel at all, because it connects from here:
+
+```sh
+go run ./spike/m0 -public-url http://localhost:8420 -obs m0-observations.jsonl
+```
+
 **Use a stable hostname.** A connector's authentication settings cannot be changed after it is
 created, so a tunnel that hands out a fresh URL on every restart means recreating the connector
 every time. Reserve a fixed domain before the first run.
@@ -58,15 +92,24 @@ Flags worth knowing:
 - `-admin` (default `127.0.0.1:8421`) — control endpoints. Loopback only; never expose it.
 - `-mcp-path` (default `/mcp`) — the MCP endpoint. The registered connector URL must be
   `<public-url><mcp-path>` exactly, with no trailing slash.
+- `-cimd-allow URL` (repeatable) — the only client metadata documents the spike will fetch.
+  Everything else is refused and recorded. A public endpoint that fetches a URL supplied by an
+  unauthenticated caller is a server-side request forgery primitive, and doing that safely is more
+  work than a throwaway program should carry; refusing by default is the honest position. If a
+  client turns out to use CIMD, add its document URL here deliberately.
 
-Control endpoints, all on the admin listener:
+Control endpoints, all on the admin listener. Each requires `POST` and the control key printed at
+startup, and refuses anything that looks like it came from a browser — these change the experiment,
+and a page the operator happens to have open should not be able to alter a run:
 
 ```
 POST /control/expire-access       expire every access token now
 POST /control/force-401           answer the next MCP request 401
 POST /control/invalidate-refresh  refuse the next refresh with invalid_grant
 POST /control/revoke-all          revoke every session
-GET  /state                       clients and sessions, fingerprints only
+POST /state                       clients and sessions, fingerprints only
+
+curl -X POST -H "X-Control-Key: $KEY" http://127.0.0.1:8421/control/force-401
 ```
 
 ## After a run

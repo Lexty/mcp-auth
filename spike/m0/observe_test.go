@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -124,6 +125,81 @@ func TestRedirectAllowed(t *testing.T) {
 		got, how := redirectAllowed(registered, tc.presented)
 		if got != tc.want || (tc.want && how != tc.how) {
 			t.Errorf("redirectAllowed(%q) = %v/%q, want %v/%q", tc.presented, got, how, tc.want, tc.how)
+		}
+	}
+}
+
+// The cases below were all reproduced by a reviewer against the first version
+// of the redactor. Each one is a path by which a secret reached the log.
+
+func TestRedactionLeaksFoundInReview(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		got  func() any
+	}{
+		{"cookie is a list of pairs, not a scheme and a credential", func() any {
+			h := http.Header{}
+			h.Set("Cookie", "session="+secret+"; other=x")
+			return redactHeaders(h)
+		}},
+		{"referer carries the callback query", func() any {
+			h := http.Header{}
+			h.Set("Referer", "https://example.com/callback?code="+secret)
+			return redactHeaders(h)
+		}},
+		{"client_assertion is a credential", func() any {
+			return redactValues(url.Values{"client_assertion": {secret}})
+		}},
+		{"a secret nested inside a URL-valued parameter", func() any {
+			return redactValues(url.Values{"redirect_uri": {"https://example.com/cb?token=" + secret}})
+		}},
+		{"an event written directly, bypassing the request redactors", func() any {
+			return scrub("redirect_uri", "https://example.com/cb?access_token="+secret)
+		}},
+		{"a secret nested in a structure written directly", func() any {
+			return scrub("document", map[string]any{
+				"redirect_uris": []any{"https://example.com/cb?code=" + secret},
+				"client_secret": secret,
+			})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, _ := json.Marshal(tc.got())
+			if strings.Contains(string(b), secret) {
+				t.Fatalf("secret survived: %s", b)
+			}
+		})
+	}
+}
+
+func TestScrubURLKeepsWhatIsNotSecret(t *testing.T) {
+	in := "https://example.com/cb?state=abc&code=" + secret + "&resource=https%3A%2F%2Fx%2Fmcp"
+	got := scrubURL(in)
+	if strings.Contains(got, secret) {
+		t.Fatalf("secret survived: %s", got)
+	}
+	for _, want := range []string{"state=abc", "example.com/cb"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected %q to survive, got %s", want, got)
+		}
+	}
+}
+
+func TestPublicIPExcludesCarrierGradeNAT(t *testing.T) {
+	for _, tc := range []struct {
+		ip   string
+		want bool
+	}{
+		{"93.184.216.34", true},
+		{"100.64.0.1", false}, // carrier-grade NAT; no net.IP predicate excludes it
+		{"100.128.0.1", true}, // just outside 100.64.0.0/10
+		{"10.0.0.1", false},
+		{"127.0.0.1", false},
+		{"169.254.169.254", false}, // cloud metadata
+		{"192.168.1.1", false},
+	} {
+		if got := publicIP(net.ParseIP(tc.ip)); got != tc.want {
+			t.Errorf("publicIP(%s) = %v, want %v", tc.ip, got, tc.want)
 		}
 	}
 }

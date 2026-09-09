@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -33,6 +34,8 @@ type Config struct {
 	AccessTTL  time.Duration
 	RefreshTTL time.Duration
 	Identity   string
+	CIMDAllow  []string
+	ControlKey string
 }
 
 func isLoopbackURL(raw string) bool {
@@ -51,9 +54,16 @@ func main() {
 	flag.StringVar(&cfg.Admin, "admin", "127.0.0.1:8421", "loopback address for control endpoints; never expose this")
 	flag.StringVar(&cfg.MCPPath, "mcp-path", "/mcp", "path of the MCP endpoint")
 	flag.StringVar(&cfg.ObsPath, "obs", "m0-observations.jsonl", "observation log")
-	flag.DurationVar(&cfg.AccessTTL, "access-ttl", 5*time.Minute, "access token lifetime; keep it short so expiry is observed rather than waited for")
+	// A client may refresh proactively up to five minutes before expiry, so a
+	// lifetime at or below that leaves no window in which the token is both
+	// live and near expiry — natural expiry behaviour would never be seen.
+	flag.DurationVar(&cfg.AccessTTL, "access-ttl", 10*time.Minute, "access token lifetime; must exceed the client's proactive refresh window to observe natural expiry")
 	flag.DurationVar(&cfg.RefreshTTL, "refresh-ttl", 24*time.Hour, "refresh token lifetime")
 	flag.StringVar(&cfg.Identity, "identity", "m0-hardcoded-subject", "the hard coded identity this spike claims")
+	flag.Func("cimd-allow", "exact client metadata document URL the spike may fetch (repeatable); anything else is refused", func(v string) error {
+		cfg.CIMDAllow = append(cfg.CIMDAllow, v)
+		return nil
+	})
 	flag.Parse()
 
 	if cfg.PublicURL == "" {
@@ -75,7 +85,11 @@ func main() {
 	}
 	defer obs.Close()
 
+	// The control endpoints change the experiment. Loopback alone does not
+	// keep a web page from reaching them, so they need a key and a method.
+	cfg.ControlKey = token(16)
 	s := &Server{cfg: cfg, obs: obs, store: NewStore()}
+	log.Printf("control key: %s", cfg.ControlKey)
 	obs.Write("spike_started", map[string]any{
 		"public_url": cfg.PublicURL, "mcp_path": cfg.MCPPath,
 		"access_ttl_s": cfg.AccessTTL.Seconds(), "resource": s.resourceURL(),
@@ -102,20 +116,43 @@ func main() {
 		http.NotFound(w, r)
 	})
 
+	// control guards every control endpoint: POST only, a key, and no browser
+	// origin. A GET from a page the operator happens to have open would
+	// otherwise silently alter a run.
+	control := func(name string, fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "POST required", http.StatusMethodNotAllowed)
+				return
+			}
+			if r.Header.Get("Origin") != "" || r.Header.Get("Sec-Fetch-Site") != "" {
+				obs.Write("control_rejected", map[string]any{"endpoint": name, "reason": "browser origin"})
+				http.Error(w, "not callable from a browser", http.StatusForbidden)
+				return
+			}
+			if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Control-Key")), []byte(cfg.ControlKey)) != 1 {
+				obs.Write("control_rejected", map[string]any{"endpoint": name, "reason": "bad key"})
+				http.Error(w, "X-Control-Key required", http.StatusForbidden)
+				return
+			}
+			fn(w, r)
+		}
+	}
+
 	adm := http.NewServeMux()
-	adm.HandleFunc("/control/force-401", func(w http.ResponseWriter, r *http.Request) {
+	adm.HandleFunc("/control/force-401", control("force-401", func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.force401 = true
 		s.mu.Unlock()
 		fmt.Fprintln(w, "next MCP request will be answered 401")
-	})
-	adm.HandleFunc("/control/invalidate-refresh", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	adm.HandleFunc("/control/invalidate-refresh", control("invalidate-refresh", func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.forceInvalidGrant = true
 		s.mu.Unlock()
 		fmt.Fprintln(w, "next refresh will be refused with invalid_grant")
-	})
-	adm.HandleFunc("/control/expire-access", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	adm.HandleFunc("/control/expire-access", control("expire-access", func(w http.ResponseWriter, r *http.Request) {
 		n := 0
 		s.store.mu.Lock()
 		for _, sess := range s.store.sessions {
@@ -125,8 +162,8 @@ func main() {
 		s.store.mu.Unlock()
 		obs.Write("access_tokens_expired_by_control", map[string]any{"sessions": n})
 		fmt.Fprintf(w, "expired %d session(s)\n", n)
-	})
-	adm.HandleFunc("/control/revoke-all", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	adm.HandleFunc("/control/revoke-all", control("revoke-all", func(w http.ResponseWriter, r *http.Request) {
 		n := 0
 		s.store.mu.Lock()
 		for _, sess := range s.store.sessions {
@@ -136,8 +173,8 @@ func main() {
 		s.store.mu.Unlock()
 		obs.Write("sessions_revoked_by_control", map[string]any{"sessions": n})
 		fmt.Fprintf(w, "revoked %d session(s)\n", n)
-	})
-	adm.HandleFunc("/state", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	adm.HandleFunc("/state", control("state", func(w http.ResponseWriter, r *http.Request) {
 		s.store.mu.Lock()
 		defer s.store.mu.Unlock()
 		clients := []any{}
@@ -156,7 +193,7 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"clients": clients, "sessions": sessions})
-	})
+	}))
 
 	pubSrv := &http.Server{Addr: cfg.Listen, Handler: obs.Middleware(pub)}
 	admSrv := &http.Server{Addr: cfg.Admin, Handler: adm}

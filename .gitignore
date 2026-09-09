@@ -1,4 +1,5 @@
-# M0 observation runs. The log is a deliverable, but it belongs in a report
-# rather than in the repository: it records a specific run on a specific day.
+# `go build ./...` writes a main package's executable into the current
+# directory. That is how a 13MB binary reached the first commit.
+/m0
 /.m0/
 /m0-observations.jsonl

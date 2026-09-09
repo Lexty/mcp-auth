@@ -52,12 +52,26 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Whether the mirrored header agrees with the body is exactly the question
-	// that decides if header-based policy is safe. Record it every time.
+	// Whether the mirrored header agrees with the body is the question that
+	// decides if header-based policy is safe anywhere. The specification puts
+	// that check on the server that processes the body, and requires it to
+	// reject — recording the disagreement and then serving the request would
+	// have made the spike itself the vulnerable backend it warns about.
 	if h := r.Header.Get("Mcp-Method"); h != "" && h != req.Method {
 		s.obs.Write("header_body_mismatch", map[string]any{
-			"header_method": h, "body_method": req.Method,
+			"exchange": Exchange(r.Context()), "header_method": h, "body_method": req.Method,
 		})
+		writeRPCErrStatus(w, req.ID, http.StatusBadRequest, -32020,
+			fmt.Sprintf("Header mismatch: Mcp-Method %q does not match body method %q", h, req.Method), nil)
+		return
+	}
+	// The version is declared in two places and they must agree, for the same
+	// reason.
+	if hv, bv := r.Header.Get("MCP-Protocol-Version"), metaVersion(req.Params); hv != "" && bv != "" && hv != bv {
+		s.obs.Write("version_header_body_mismatch", map[string]any{"header": hv, "meta": bv})
+		writeRPCErrStatus(w, req.ID, http.StatusBadRequest, -32020,
+			"Header mismatch: MCP-Protocol-Version does not match _meta", nil)
+		return
 	}
 
 	// Reject an unsupported version the way the specification requires, so that
@@ -112,8 +126,23 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 		}
 		json.Unmarshal(req.Params, &p)
 		s.obs.Write("tool_called", map[string]any{
-			"session": sess.ID, "tool": p.Name, "header_name": r.Header.Get("Mcp-Name"),
+			"exchange": Exchange(r.Context()),
+			"session":  sess.ID, "tool": p.Name, "header_name": r.Header.Get("Mcp-Name"),
 		})
+		if h := r.Header.Get("Mcp-Name"); h != "" && h != p.Name {
+			s.obs.Write("header_body_mismatch", map[string]any{
+				"header_name": h, "body_name": p.Name,
+			})
+			writeRPCErrStatus(w, req.ID, http.StatusBadRequest, -32020,
+				fmt.Sprintf("Header mismatch: Mcp-Name %q does not match body name %q", h, p.Name), nil)
+			return
+		}
+		if p.Name != "whoami" {
+			// Returning whoami for any name would mean the spike could not
+			// tell a policy question from a typo.
+			writeRPCErr(w, req.ID, -32602, "unknown tool: "+p.Name)
+			return
+		}
 		writeRPC(w, req.ID, map[string]any{"content": []any{map[string]any{
 			"type": "text",
 			"text": fmt.Sprintf("subject=%s session=%s generation=%d resource=%s",
@@ -222,6 +251,19 @@ func rawOrNull(id json.RawMessage) any {
 		return nil
 	}
 	return id
+}
+
+// metaVersion reads the protocol version a modern client puts in _meta, so it
+// can be compared with the header that mirrors it.
+func metaVersion(params json.RawMessage) string {
+	var p struct {
+		Meta map[string]any `json:"_meta"`
+	}
+	if json.Unmarshal(params, &p) != nil {
+		return ""
+	}
+	v, _ := p.Meta["io.modelcontextprotocol/protocolVersion"].(string)
+	return v
 }
 
 func rawAny(b json.RawMessage) any {

@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
+	crand "crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,9 +32,19 @@ var secretParams = map[string]bool{
 	"refresh_token":             true,
 	"token":                     true,
 	"id_token":                  true,
+	"id_token_hint":             true,
 	"registration_access_token": true,
 	"assertion":                 true,
+	"client_assertion":          true,
+	"subject_token":             true,
+	"actor_token":               true,
 	"password":                  true,
+	"authorization":             true,
+	"apikey":                    true,
+	"api_key":                   true,
+	"secret":                    true,
+	"session":                   true,
+	"sid":                       true,
 }
 
 // secretHeaders are headers whose value is never recorded.
@@ -40,6 +53,14 @@ var secretHeaders = map[string]bool{
 	"proxy-authorization": true,
 	"cookie":              true,
 	"set-cookie":          true,
+	"x-api-key":           true,
+}
+
+// responseHeadersRecorded is an allow list. The log has to show what was
+// actually sent — WWW-Authenticate and Location are evidence — but recording
+// every response header invites the next leak.
+var responseHeadersRecorded = []string{
+	"WWW-Authenticate", "Location", "Content-Type", "Cache-Control", "X-Frame-Options",
 }
 
 // Fingerprint turns a secret into something that can be compared across
@@ -54,6 +75,72 @@ func Fingerprint(s string) string {
 	return fmt.Sprintf("sha256:%x len=%d", sum[:4], len(s))
 }
 
+// scrubURL removes secret query parameters from a URL that is itself a value
+// somewhere — redirect_uri, resource, Referer, Location. A secret nested one
+// level down is still a secret, and this is the path that leaked.
+func scrubURL(s string) string {
+	if !strings.Contains(s, "?") {
+		return s
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.RawQuery == "" {
+		return s
+	}
+	q := u.Query()
+	changed := false
+	for k, vs := range q {
+		if !secretParams[strings.ToLower(k)] {
+			continue
+		}
+		for i := range vs {
+			vs[i] = Fingerprint(vs[i])
+		}
+		q[k] = vs
+		changed = true
+	}
+	if !changed {
+		return s
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// scrub is applied to every value that reaches the log, from any code path.
+// Checking the individual redactors was not enough: events written directly
+// bypassed them, which is how a URL-borne secret got through.
+func scrub(key string, v any) any {
+	if secretParams[strings.ToLower(key)] {
+		if str, ok := v.(string); ok {
+			return Fingerprint(str)
+		}
+		return "[redacted]"
+	}
+	switch t := v.(type) {
+	case string:
+		return scrubURL(t)
+	case []string:
+		out := make([]string, len(t))
+		for i, x := range t {
+			out[i] = scrubURL(x)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			out[k] = scrub(k, val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = scrub("", val)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
 func redactValues(v url.Values) map[string]any {
 	out := map[string]any{}
 	for k, vs := range v {
@@ -65,10 +152,18 @@ func redactValues(v url.Values) map[string]any {
 			continue
 		}
 		if len(vs) == 1 {
-			out[k] = vs[0]
+			out[k] = scrubURL(vs[0])
 		} else {
-			out[k] = vs
+			out[k] = scrub("", toAny(vs))
 		}
+	}
+	return out
+}
+
+func toAny(vs []string) []any {
+	out := make([]any, len(vs))
+	for i, v := range vs {
+		out[i] = v
 	}
 	return out
 }
@@ -79,7 +174,15 @@ func redactHeaders(h http.Header) map[string]any {
 		if len(vs) == 0 {
 			continue
 		}
-		if secretHeaders[strings.ToLower(k)] {
+		lk := strings.ToLower(k)
+		if lk == "cookie" || lk == "set-cookie" {
+			// A cookie header is a list of name=value pairs, not a scheme and
+			// a credential. Splitting it on a space kept the first pair in
+			// the clear. Nothing from it is recorded but its shape.
+			out[k] = fmt.Sprintf("[%d cookie(s), not recorded]", len(strings.Split(vs[0], ";")))
+			continue
+		}
+		if secretHeaders[lk] {
 			// Record the scheme but never the credential: "Bearer" plus a
 			// fingerprint tells us which token was used without storing it.
 			f := vs[0]
@@ -90,10 +193,11 @@ func redactHeaders(h http.Header) map[string]any {
 			}
 			continue
 		}
+		// Referer and Location are URLs, and a URL is a place a secret hides.
 		if len(vs) == 1 {
-			out[k] = vs[0]
+			out[k] = scrubURL(vs[0])
 		} else {
-			out[k] = vs
+			out[k] = scrub("", toAny(vs))
 		}
 	}
 	return out
@@ -156,6 +260,30 @@ func redactBody(contentType string, b []byte) any {
 	}
 }
 
+type ctxKey int
+
+const exchangeKey ctxKey = 0
+
+func WithExchange(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, exchangeKey, id)
+}
+
+// Exchange returns the correlation id for the HTTP exchange a handler is
+// serving, so that events written from inside a handler join up with the
+// request and response lines around them.
+func Exchange(ctx context.Context) string {
+	if v, ok := ctx.Value(exchangeKey).(string); ok {
+		return v
+	}
+	return ""
+}
+
+func randHex(n int) string {
+	b := make([]byte, n)
+	crand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 // Obs is the observation log.
 type Obs struct {
 	mu sync.Mutex
@@ -178,7 +306,7 @@ func (o *Obs) Write(kind string, fields map[string]any) {
 		"kind": kind,
 	}
 	for k, v := range fields {
-		rec[k] = v
+		rec[k] = scrub(k, v)
 	}
 	b, err := json.Marshal(rec)
 	if err != nil {
@@ -186,7 +314,12 @@ func (o *Obs) Write(kind string, fields map[string]any) {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.f.Write(append(b, '\n'))
+	if _, err := o.f.Write(append(b, '\n')); err != nil {
+		// The log is the deliverable. Losing a line silently would mean
+		// reporting an observation that was never recorded.
+		fmt.Fprintf(os.Stderr, "FATAL: cannot write observation log: %v\n", err)
+		os.Exit(1)
+	}
 	o.f.Sync()
 	fmt.Fprintf(os.Stderr, "%s %s\n", kind, string(b))
 }
@@ -230,6 +363,11 @@ func (c *capture) Flush() {
 func (o *Obs) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		// Without this, two concurrent exchanges cannot be told apart in the
+		// log, and the rotation observations are exactly the ones that
+		// interleave.
+		xid := "x" + randHex(6)
+		r = r.WithContext(WithExchange(r.Context(), xid))
 
 		var body []byte
 		if r.Body != nil {
@@ -239,21 +377,30 @@ func (o *Obs) Middleware(next http.Handler) http.Handler {
 		}
 
 		o.Write("request", map[string]any{
-			"method":  r.Method,
-			"path":    r.URL.Path,
-			"query":   redactValues(r.URL.Query()),
-			"headers": redactHeaders(r.Header),
-			"body":    redactBody(r.Header.Get("Content-Type"), body),
-			"remote":  r.RemoteAddr,
+			"exchange": xid,
+			"method":   r.Method,
+			"path":     r.URL.Path,
+			"query":    redactValues(r.URL.Query()),
+			"headers":  redactHeaders(r.Header),
+			"body":     redactBody(r.Header.Get("Content-Type"), body),
+			"remote":   r.RemoteAddr,
 		})
 
 		c := &capture{ResponseWriter: w, keep: true}
 		next.ServeHTTP(c, r)
 
+		sent := map[string]any{}
+		for _, h := range responseHeadersRecorded {
+			if v := c.Header().Get(h); v != "" {
+				sent[h] = scrubURL(v)
+			}
+		}
 		o.Write("response", map[string]any{
+			"exchange":    xid,
 			"method":      r.Method,
 			"path":        r.URL.Path,
 			"status":      c.status,
+			"headers":     sent,
 			"bytes":       c.n,
 			"duration_ms": time.Since(start).Milliseconds(),
 			"body":        redactBody(c.Header().Get("Content-Type"), c.buf.Bytes()),
