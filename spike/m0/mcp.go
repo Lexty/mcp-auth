@@ -1,0 +1,183 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+)
+
+// A minimal MCP endpoint with one tool. It answers both shapes of the
+// transport — the older initialize handshake and the newer per-request
+// metadata form — because which one the client speaks is one of the things M0
+// has to find out rather than assume.
+
+type rpcReq struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
+	// Record the transport-level facts before anything else: these decide
+	// whether per-tool policy can ever be enforced from headers.
+	s.obs.Write("mcp_transport", map[string]any{
+		"protocol_version": r.Header.Get("MCP-Protocol-Version"),
+		"mcp_method":       r.Header.Get("Mcp-Method"),
+		"mcp_name":         r.Header.Get("Mcp-Name"),
+		"session_id":       r.Header.Get("Mcp-Session-Id"),
+		"accept":           r.Header.Get("Accept"),
+		"http_method":      r.Method,
+	})
+
+	if r.Method == http.MethodGet || r.Method == http.MethodDelete {
+		// Older revisions use these; newer ones do not. Answering 405 and
+		// recording it tells us which era the client believes it is in.
+		s.obs.Write("mcp_legacy_method", map[string]any{"method": r.Method})
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	sess, ok := s.authorizeRequest(w, r)
+	if !ok {
+		return
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	var req rpcReq
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "bad JSON-RPC", http.StatusBadRequest)
+		return
+	}
+
+	// Whether the mirrored header agrees with the body is exactly the question
+	// that decides if header-based policy is safe. Record it every time.
+	if h := r.Header.Get("Mcp-Method"); h != "" && h != req.Method {
+		s.obs.Write("header_body_mismatch", map[string]any{
+			"header_method": h, "body_method": req.Method,
+		})
+	}
+
+	switch req.Method {
+	case "initialize":
+		s.obs.Write("mcp_initialize", map[string]any{"session": sess.ID, "params": redactJSON(rawAny(req.Params))})
+		// Answer without minting a session id: whether the client then insists
+		// on one is itself an observation.
+		writeRPC(w, req.ID, map[string]any{
+			"protocolVersion": "2025-06-18",
+			"capabilities":    map[string]any{"tools": map[string]any{}},
+			"serverInfo":      map[string]any{"name": "m0-spike", "version": "0"},
+		})
+	case "notifications/initialized":
+		w.WriteHeader(http.StatusAccepted)
+	case "tools/list":
+		writeRPC(w, req.ID, map[string]any{"tools": []any{map[string]any{
+			"name":        "whoami",
+			"description": "Returns the identity the gateway spike believes is calling.",
+			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+		}}})
+	case "tools/call":
+		var p struct {
+			Name string `json:"name"`
+		}
+		json.Unmarshal(req.Params, &p)
+		s.obs.Write("tool_called", map[string]any{
+			"session": sess.ID, "tool": p.Name, "header_name": r.Header.Get("Mcp-Name"),
+		})
+		writeRPC(w, req.ID, map[string]any{"content": []any{map[string]any{
+			"type": "text",
+			"text": fmt.Sprintf("subject=%s session=%s generation=%d resource=%s",
+				s.cfg.Identity, sess.ID, sess.Generation, sess.Resource),
+		}}})
+	default:
+		writeRPCErr(w, req.ID, -32601, "method not found: "+req.Method)
+	}
+}
+
+// authorizeRequest is the whole access decision in the spike: a valid,
+// unexpired, unrevoked token. No policy, no roles, no upstream.
+func (s *Server) authorizeRequest(w http.ResponseWriter, r *http.Request) (*Session, bool) {
+	s.mu.Lock()
+	forced := s.force401
+	s.force401 = false
+	s.mu.Unlock()
+	if forced {
+		s.obs.Write("forced_401", nil)
+		s.challenge(w, "forced by control endpoint")
+		return nil, false
+	}
+
+	auth := r.Header.Get("Authorization")
+	if len(auth) < 8 || auth[:7] != "Bearer " {
+		s.obs.Write("unauthenticated_request", map[string]any{"had_authorization": auth != ""})
+		s.challenge(w, "no bearer token")
+		return nil, false
+	}
+	tok := auth[7:]
+
+	s.store.mu.Lock()
+	id, ok := s.store.byAccess[tok]
+	var sess *Session
+	if ok {
+		sess = s.store.sessions[id]
+	}
+	s.store.mu.Unlock()
+
+	switch {
+	case sess == nil:
+		s.obs.Write("token_unknown", map[string]any{"token_fp": Fingerprint(tok)})
+		s.challenge(w, "unknown token")
+		return nil, false
+	case sess.Revoked:
+		s.obs.Write("token_revoked", map[string]any{"session": sess.ID})
+		s.challenge(w, "session revoked")
+		return nil, false
+	case time.Now().After(sess.AccessExp):
+		s.obs.Write("token_expired", map[string]any{
+			"session": sess.ID, "expired_s_ago": time.Since(sess.AccessExp).Seconds(),
+		})
+		s.challenge(w, "token expired")
+		return nil, false
+	}
+	return sess, true
+}
+
+// challenge returns the 401 that starts discovery. The header must point at
+// the protected resource metadata, and the status must be 401 — a client will
+// not read this header off a 200.
+func (s *Server) challenge(w http.ResponseWriter, why string) {
+	w.Header().Set("WWW-Authenticate",
+		fmt.Sprintf(`Bearer resource_metadata=%q`, s.issuer()+"/.well-known/oauth-protected-resource"))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	json.NewEncoder(w).Encode(map[string]any{"error": "unauthorized", "detail": why})
+}
+
+func writeRPC(w http.ResponseWriter, id json.RawMessage, result any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": rawOrNull(id), "result": result})
+}
+
+func writeRPCErr(w http.ResponseWriter, id json.RawMessage, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	json.NewEncoder(w).Encode(map[string]any{
+		"jsonrpc": "2.0", "id": rawOrNull(id),
+		"error": map[string]any{"code": code, "message": msg},
+	})
+}
+
+func rawOrNull(id json.RawMessage) any {
+	if len(id) == 0 {
+		return nil
+	}
+	return id
+}
+
+func rawAny(b json.RawMessage) any {
+	var v any
+	json.Unmarshal(b, &v)
+	return v
+}
