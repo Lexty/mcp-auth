@@ -26,6 +26,11 @@ Beyond that filter it must also offer per-client consent, controllable revocatio
 session chain, and a storage model compatible with the deployment constraints. The filter is an
 entry condition, not the full acceptance.
 
+**What M0 added.** The client sends `resource` on both the authorization and token requests, so a
+candidate can be tested against real traffic rather than against a reading of the RFC. It also
+registers by Client ID Metadata Document, so a candidate must resolve those, with an admission
+policy — not merely expose a registration endpoint.
+
 **What is already known.** Keycloak does not pass the filter in this role: it does not implement
 RFC 8707 [R8]. Note the asymmetry — as an *upstream* it is a good fit, because nothing in that role
 depends on resource indicators. (Not because "only sign-in is required": every upstream still owes
@@ -46,6 +51,9 @@ registered as an Application ID URI [R4], completes OAuth and calls a tool.
 
 **Decided by:** M0 Experiment A. A success is a fact about today's configuration and today's
 software versions, and it is worth exactly that.
+
+*Narrowed 2026-09-09:* the broker path now works end to end with a **native** client
+(`m0-observations.md`). That says nothing about the direct path, and nothing about a hosted one.
 
 ## Q2b. What caused the historically reported failure to POST to `/token`?
 
@@ -76,8 +84,12 @@ for arbitrary backends cannot simply drop the session header on that basis: the 
 and backend versions have to be pinned first. The gateway does not need an MCP session of its
 own — its OAuth session is separate state — but it may need to pass one through faithfully.
 
-**Decided by:** the protocol version observed in M0, plus the versions the intended backends
-speak.
+**Narrowed 2026-09-09.** The version observed in the field is **`2026-07-28`** — no protocol
+sessions, no GET stream, `server/discover` instead of `initialize`, and mirrored `Mcp-Method` and
+`Mcp-Name` headers that agreed with the body on every request (`m0-observations.md`). What remains
+open is how far back to support, which depends on the backends, not on the client.
+
+**Decided by:** the versions the intended backends speak.
 
 ---
 
@@ -133,8 +145,13 @@ Note also that upstream token lifetimes are the provider's policy, not ours — 
 default is reported for Entra but unverified here [C2] — so any design depending on upstream token
 expiry cannot simply declare a number.
 
-**Decided by:** the security review, informed by what M0 shows about how often the client
-re-authorises.
+**Narrowed 2026-09-09, and one end of the range is now fixed.** The client refreshes proactively
+up to five minutes before expiry, measured at 288.7 seconds (`m0-observations.md`). So an access
+token lifetime at or below five minutes would be refreshed essentially on issue: the shortest
+useful lifetime is bounded by the client's refresh window, not by our preference. Refresh rotation
+is safe — five rotations, no replay of a retired token — so the design is not forced to weaken it.
+
+**Decided by:** the security review, for the upper end.
 
 ---
 
@@ -153,8 +170,12 @@ metadata alone: "any local process can bind a port and claim to be the legitimat
 Supporting only hosted clients keeps redirect matching absolutely exact, which is one fewer thing to
 justify to a reviewer — at the cost of not serving developers on their own machines.
 
-**Decided by:** a decision record, informed by which clients M0 actually exercises and by whether
-local use is wanted at all.
+*Sharpened 2026-09-09:* the exception is exercised in practice, not hypothetically. The observed
+client registered two port-less loopback URIs and presented `http://localhost:57104/callback`
+(`m0-observations.md`). Supporting native clients therefore means the port-agnostic match is real
+code on a real path, not a footnote.
+
+**Decided by:** a decision record, informed by whether local use is wanted at all.
 
 ---
 
