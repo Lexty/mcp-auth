@@ -52,8 +52,9 @@ registered as an Application ID URI [R4], completes OAuth and calls a tool.
 **Decided by:** M0 Experiment A. A success is a fact about today's configuration and today's
 software versions, and it is worth exactly that.
 
-*Narrowed 2026-09-09:* the broker path now works end to end with a **native** client
-(`m0-observations.md`). That says nothing about the direct path, and nothing about a hosted one.
+*Narrowed 2026-09-09:* the broker path now works end to end with **both** a native client and a
+hosted custom connector (`m0-observations.md`). That still says nothing about the direct path to an
+identity provider, which is what this question is about.
 
 ## Q2b. What caused the historically reported failure to POST to `/token`?
 

@@ -4,8 +4,9 @@ Date: 2026-09-09. Method: two agents (Claude and Codex) working as peers, each c
 other's claims against primary sources rather than recollection.
 
 **Verdict: conditional yes.** The architecture the brief proposes is sound. The reasoning the
-brief gives for it is not. Two of the three founding premises are wrong, the third is unproven,
-and the real justification is something the brief does not mention at all.
+brief gives for it is not. **All three founding premises are wrong** — two were refuted against
+primary sources during this validation, and the third was refuted by observation during M0 — and
+the real justification is something the brief does not mention at all.
 
 This distinction matters more than it might appear. The brief states its premises as settled and
 instructs the reader not to re-check them, and it says "the whole architecture grows out of
@@ -69,7 +70,7 @@ not an assumption.
 
 See references [R4], [R5].
 
-### 1.3 "The backend never POSTs to `/token`" — unproven, not refuted
+### 1.3 "The backend never POSTs to `/token`" — refuted by observation, 2026-09-09
 
 This one stands as an open question rather than a refuted claim. The brief cites two issues as
 independent evidence. Neither has been read here; what is recorded is that a peer found the later
@@ -79,11 +80,21 @@ two [C4]. Either way they establish that users reported a failure, not why the f
 It is also plausible — but only plausible — that the reported symptom is the `AADSTS9010010`
 rejection seen from the operator's side. Nothing here establishes that.
 
-**And M0 will not establish it either.** M0 can show whether the direct path works today with a
-corrected configuration; succeeding at that says nothing about why a different configuration failed
-before. Attributing the historical cause would need the original configuration or trace, or a
-deliberate reproduction with one controlled variable. The two questions are separated in
-`open-questions.md` as Q2a and Q2b, and only Q2a is on M0's list.
+**Settled by observation.** A real custom connector on the hosted surface was pointed at our own
+authorization server on 2026-09-09. It completed the browser authorization, and its backend then
+**did** `POST /token` — with the code, the verifier and `resource` — and received a token, after
+which it called `server/discover` and `tools/list` successfully. The observation log is
+`m0-observations.md`.
+
+So the premise is false as stated: the backend does post to `/token`. What remains unknown is why
+the originally reported flows stopped, and that is a different question — an experiment that
+succeeds says nothing about why some other configuration failed. It stays open as
+`open-questions.md` Q2b, and nothing depends on it.
+
+**All three of the brief's founding premises are now false.** Two were refuted against
+documentation during validation; the third has now been refuted against a live client. The section
+they appear in is labelled "already established, no need to re-check", and it was wrong three times
+out of three. That is worth remembering the next time a document arrives with a section like it.
 
 ## 2. The justification that actually holds
 
