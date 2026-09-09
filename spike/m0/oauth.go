@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,66 @@ type Store struct {
 	// retired refresh tokens, kept so we can observe a client presenting one
 	// after rotation instead of silently treating it as unknown.
 	retiredRefresh map[string]string
+}
+
+// snapshot is the on-disk shape of the store.
+//
+// M0's design notes call for in-memory storage, and this does not change that:
+// the spike still holds everything in memory and the file is a convenience for
+// running the experiment. Without it, every restart invalidates the client's
+// tokens and a human has to complete a browser sign-in again — which during a
+// session of fixing spec details is several interruptions for no observational
+// gain. The file holds live tokens in the clear, is written 0600, and is
+// covered by .gitignore. It is not a design for the gateway's store.
+type snapshot struct {
+	Clients        map[string]*Client  `json:"clients"`
+	Sessions       map[string]*Session `json:"sessions"`
+	RetiredRefresh map[string]string   `json:"retired_refresh"`
+}
+
+func (s *Store) Save(path string) error {
+	if path == "" {
+		return nil
+	}
+	s.mu.Lock()
+	snap := snapshot{Clients: s.clients, Sessions: s.sessions, RetiredRefresh: s.retiredRefresh}
+	b, err := json.Marshal(snap)
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
+}
+
+func (s *Store) Load(path string) error {
+	if path == "" {
+		return nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var snap snapshot
+	if err := json.Unmarshal(b, &snap); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, c := range snap.Clients {
+		s.clients[id] = c
+	}
+	for id, sess := range snap.Sessions {
+		s.sessions[id] = sess
+		s.byAccess[sess.AccessToken] = id
+		s.byRefresh[sess.RefreshToken] = id
+	}
+	for t, id := range snap.RetiredRefresh {
+		s.retiredRefresh[t] = id
+	}
+	return nil
 }
 
 func NewStore() *Store {

@@ -34,6 +34,7 @@ type Config struct {
 	AccessTTL  time.Duration
 	RefreshTTL time.Duration
 	Identity   string
+	StatePath  string
 	CIMDAllow  []string
 	ControlKey string
 }
@@ -59,6 +60,7 @@ func main() {
 	// live and near expiry — natural expiry behaviour would never be seen.
 	flag.DurationVar(&cfg.AccessTTL, "access-ttl", 10*time.Minute, "access token lifetime; must exceed the client's proactive refresh window to observe natural expiry")
 	flag.DurationVar(&cfg.RefreshTTL, "refresh-ttl", 24*time.Hour, "refresh token lifetime")
+	flag.StringVar(&cfg.StatePath, "state", ".m0/state.json", "where to keep clients and sessions across restarts; holds live tokens in the clear, mode 0600. Empty disables it")
 	flag.StringVar(&cfg.Identity, "identity", "m0-hardcoded-subject", "the hard coded identity this spike claims")
 	flag.Func("cimd-allow", "exact client metadata document URL the spike may fetch (repeatable); anything else is refused", func(v string) error {
 		cfg.CIMDAllow = append(cfg.CIMDAllow, v)
@@ -89,6 +91,9 @@ func main() {
 	// keep a web page from reaching them, so they need a key and a method.
 	cfg.ControlKey = token(16)
 	s := &Server{cfg: cfg, obs: obs, store: NewStore()}
+	if err := s.store.Load(cfg.StatePath); err != nil {
+		log.Fatalf("cannot read %s: %v", cfg.StatePath, err)
+	}
 	log.Printf("control key: %s", cfg.ControlKey)
 	obs.Write("spike_started", map[string]any{
 		"public_url": cfg.PublicURL, "mcp_path": cfg.MCPPath,
@@ -218,6 +223,9 @@ func main() {
 	defer cancel()
 	pubSrv.Shutdown(ctx)
 	admSrv.Shutdown(ctx)
+	if err := s.store.Save(cfg.StatePath); err != nil {
+		log.Printf("could not save state: %v", err)
+	}
 	obs.Write("spike_stopped", nil)
 	log.Printf("observations written to %s", cfg.ObsPath)
 }

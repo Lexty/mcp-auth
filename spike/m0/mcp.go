@@ -117,8 +117,17 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 	case "tools/list":
 		writeRPC(w, req.ID, map[string]any{
 			// resultType is required in this revision, and its absence is
-			// what the real client rejected the first list on.
+			// what the real client rejected the first list on. It then
+			// rejected the next one for missing ttlMs and cacheScope, which
+			// the specification's example shows but does not mark required.
+			//
+			// "private" is not a placeholder. A tool list that varies by the
+			// caller's entitlement is not publicly cacheable, and the client
+			// making the server say which it is turns out to be a good design
+			// — see docs/architecture.md.
 			"resultType": "complete",
+			"ttlMs":      60000,
+			"cacheScope": "private",
 			"tools": []any{map[string]any{
 				"name":        "whoami",
 				"description": "Returns the identity the gateway spike believes is calling.",
